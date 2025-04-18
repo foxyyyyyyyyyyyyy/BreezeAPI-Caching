@@ -1,0 +1,26 @@
+{
+  "name": "@breezeapi/cache",
+  "version": "1.0.0",
+  "type": "module",
+  "module": "dist/src/lib.js",
+  "types": "dist/src/lib.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --project tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "build2": "tsc --noEmitOnError --project tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "tsc-alias": "^1.8.11"
+  },
+  "peerDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
