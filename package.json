@@ -1,6 +1,6 @@
 {
   "name": "@breezeapi/cache",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "module": "dist/src/lib.js",
   "types": "dist/src/lib.d.ts",

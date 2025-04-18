@@ -12,7 +12,7 @@ import { parseDuration } from './parseDuration'; // <-- Add this import
 export const cacheConfigSchema = z.object({
     enabled: z.boolean().default(true), // Caching active or not
     cacheKey: z.string().optional(), // Optional cache key for custom cache key generation if nothing is provided, the URL will be used as the cache key 
-    duration: z.number().int().positive(), // Cache duration in seconds
+    duration: z.string(), // Cache duration as a string (e.g. "5s", "2h")
 });
 
 /**
