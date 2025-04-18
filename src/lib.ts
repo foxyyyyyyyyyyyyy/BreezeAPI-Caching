@@ -49,13 +49,18 @@ export function initializeCache() {
     if (!parseResult.success) {
         throw new Error("[BREEZEAPI - CACHING] Invalid config: " + parseResult.error);
     }
-    const { redisUrl } = parseResult.data;
+    const { redisUrl, debug } = parseResult.data;
     if (!redisUrl) {
         throw new Error("[BREEZEAPI - CACHING] No redisUrl provided in config.");
     }
     if (_sharedRedisClient && _sharedRedisUrl === redisUrl) {
         // Already initialized with same URL
         return;
+    }
+    // If changing Redis URL, close previous shared client
+    if (_sharedRedisClient && _sharedRedisUrl && _sharedRedisUrl !== redisUrl) {
+        if (debug) console.log("[BREEZEAPI - CACHING] Closing previous shared Redis client");
+        try { _sharedRedisClient.close?.(); } catch {}
     }
     _sharedRedisClient = new RedisClient(redisUrl);
     _sharedRedisUrl = redisUrl;
@@ -120,37 +125,47 @@ export function cacheMiddleware(conf: z.infer<typeof cacheConfigSchema>) {
 
         // Use shared Redis client if initialized, else create a new one
         let client: RedisClient;
+        let shouldCloseClient = false;
         if (_sharedRedisClient && _sharedRedisUrl === redisUrl) {
             client = _sharedRedisClient;
             _cacheInitialized = true;
         } else {
             client = new RedisClient(redisUrl);
             _cacheInitialized = true;
+            shouldCloseClient = true;
         }
 
         const cacheKey = req.url;
         if (debug) console.log(`[BREEZEAPI - CACHING] Checking cache for key: ${cacheKey}`);
-        const cached = await client.get(cacheKey);
-        if (cached) {
-            try {
-                if (debug) console.log(`[BREEZEAPI - CACHING] Cache HIT for key: ${cacheKey}`);
-                res.header?.("X-BREEZEAPI-CACHE", "HIT");
-                return res.json(JSON.parse(cached));
-            } catch (e) {
-                // If cache is corrupted, ignore and proceed
-                console.warn("[breezeCache] Failed to parse cached value for", cacheKey, e);
-            }
-        } else {
-            if (debug) console.log(`[BREEZEAPI - CACHING] Cache MISS for key: ${cacheKey}`);
-        }
 
-        // Patch res.json to allow .cache() chaining
+        // Patch res.json BEFORE cache check so .cache() is always available
         const originalJson = res.json.bind(res);
+        let alreadyCached = false;
+        let cacheHitValue: any = undefined;
+        let cacheHit = false;
         res.json = (body: any) => {
+            // If cache HIT, always return the cached value and .cache() is a no-op
+            if (cacheHit) {
+                const response = originalJson(cacheHitValue);
+                Object.defineProperty(response, "cache", {
+                    value: async () => {
+                        if (debug) console.log(`[BREEZEAPI - CACHING] (json.cache) No-op: already cached for key: ${cacheKey}`);
+                        return response;
+                    },
+                    enumerable: false,
+                    configurable: true,
+                    writable: false
+                });
+                return response as ApiResponseWithCache;
+            }
             const response = originalJson(body);
-            // Attach a .cache() method to the returned object
             Object.defineProperty(response, "cache", {
                 value: async () => {
+                    if (alreadyCached) {
+                        if (debug) console.log(`[BREEZEAPI - CACHING] (json.cache) Skipping cache: already cached for key: ${cacheKey}`);
+                        return response;
+                    }
+                    alreadyCached = true;
                     let durationSeconds = 60;
                     if (conf?.duration !== undefined) {
                         if (typeof conf.duration === "string") {
@@ -162,10 +177,19 @@ export function cacheMiddleware(conf: z.infer<typeof cacheConfigSchema>) {
                     if (debug) {
                         console.log(`[BREEZEAPI - CACHING] (json.cache) Caching response for key: ${cacheKey} for ${durationSeconds}s`);
                     }
-                    await client.set(cacheKey, JSON.stringify(body));
-                    await client.expire(cacheKey, durationSeconds);
+                    try {
+                        await client.set(cacheKey, JSON.stringify(body));
+                        await client.expire(cacheKey, durationSeconds);
+                    } catch (err) {
+                        if (debug) console.error("[BREEZEAPI - CACHING] Redis SET/EXPIRE error:", err);
+                    }
+                    // Only close per-request clients, never the shared client
+                    if (shouldCloseClient && typeof client.close === "function") {
+                        if (debug) console.log("[BREEZEAPI - CACHING] Closing per-request Redis client");
+                        try { await client.close(); } catch {}
+                    }
                     res.header?.("X-BREEZEAPI-CACHE", "MISS");
-                    return response; // <-- Return the response object for chaining
+                    return response;
                 },
                 enumerable: false,
                 configurable: true,
@@ -174,51 +198,77 @@ export function cacheMiddleware(conf: z.infer<typeof cacheConfigSchema>) {
             return response as ApiResponseWithCache;
         };
 
+        let cached: string | null = null;
+        let retried = false;
+        async function tryGetCache() {
+            try {
+                cached = await client.get(cacheKey);
+                return true;
+            } catch (err: any) {
+                if (err?.code === "ERR_REDIS_CONNECTION_CLOSED") {
+                    if (debug) console.warn("[BREEZEAPI - CACHING] Redis connection closed, will attempt to reconnect.");
+                } else {
+                    if (debug) console.error("[BREEZEAPI - CACHING] Redis GET error:", err);
+                }
+                // If connection closed, try to reopen ONCE
+                if (!retried && err?.code === "ERR_REDIS_CONNECTION_CLOSED") {
+                    retried = true;
+                    if (shouldCloseClient && typeof client.close === "function") {
+                        if (debug) console.log("[BREEZEAPI - CACHING] Closing per-request Redis client after connection closed");
+                        try { await client.close(); } catch {}
+                    }
+                    // Recreate client
+                    if (shouldCloseClient) {
+                        client = new RedisClient(redisUrl);
+                    } else if (_sharedRedisClient && _sharedRedisUrl === redisUrl) {
+                        if (debug) console.log("[BREEZEAPI - CACHING] Reopening shared Redis client after connection closed");
+                        _sharedRedisClient = new RedisClient(redisUrl);
+                        client = _sharedRedisClient;
+                    }
+                    // Try again
+                    try {
+                        cached = await client.get(cacheKey);
+                        return true;
+                    } catch (err2: any) {
+                        if (debug) console.error("[BREEZEAPI - CACHING] Redis GET retry failed:", err2);
+                        // Give up, skip cache
+                        return false;
+                    }
+                }
+                // Give up, skip cache
+                return false;
+            }
+        }
+        const cacheOk = await tryGetCache();
+        if (!cacheOk) {
+            // Only close per-request clients, never the shared client
+            if (shouldCloseClient && typeof client.close === "function") {
+                if (debug) console.log("[BREEZEAPI - CACHING] Closing per-request Redis client after cache fail");
+                try { await client.close(); } catch {}
+            }
+            return next();
+        }
+        if (cached) {
+            try {
+                alreadyCached = true;
+                cacheHit = true;
+                cacheHitValue = JSON.parse(cached);
+                if (debug) console.log(`[BREEZEAPI - CACHING] Cache HIT for key: ${cacheKey}`);
+                res.header?.("X-BREEZEAPI-CACHE", "HIT");
+                // Only close per-request clients, never the shared client
+                if (shouldCloseClient && typeof client.close === "function") {
+                    if (debug) console.log("[BREEZEAPI - CACHING] Closing per-request Redis client");
+                    try { await client.close(); } catch {}
+                }
+            } catch (e) {
+                // If cache is corrupted, ignore and proceed
+                console.warn("[breezeCache] Failed to parse cached value for", cacheKey, e);
+            }
+        } else {
+            if (debug) console.log(`[BREEZEAPI - CACHING] Cache MISS for key: ${cacheKey}`);
+        }
+
         return next();
     };
 }
 
-/**
- * Helper to set the cache for a response manually in a route handler.
- * Call this in your handler to cache the response body.
- * Example:
- *   export async function GET(req, res) {
- *     setCache(req, res, { duration: "1h" }, responseBody);
- *     return res.json(responseBody);
- *   }
- */
-export async function setCache(
-    req: apiRequest,
-    res: apiResponse,
-    conf: z.infer<typeof cacheConfigSchema>,
-    body: any
-) {
-    const BreezeConfig = Config.get('breezeCache');
-    const parseResult = breezeCacheConfigSchema.safeParse(BreezeConfig);
-    if (!parseResult.success) return;
-    const { redisUrl, debug } = parseResult.data;
-    if (!redisUrl) return;
-
-    let client: RedisClient;
-    if (_sharedRedisClient && _sharedRedisUrl === redisUrl) {
-        client = _sharedRedisClient;
-    } else {
-        client = new RedisClient(redisUrl);
-    }
-
-    const cacheKey = req.url;
-    let durationSeconds = 60;
-    if (conf?.duration !== undefined) {
-        if (typeof conf.duration === "string") {
-            durationSeconds = Math.floor(parseDuration(conf.duration) / 1000);
-        } else if (typeof conf.duration === "number") {
-            durationSeconds = conf.duration;
-        }
-    }
-    if (debug) {
-        console.log(`[BREEZEAPI - CACHING] (setCache) Caching response for key: ${cacheKey} for ${durationSeconds}s`);
-    }
-    await client.set(cacheKey, JSON.stringify(body));
-    await client.expire(cacheKey, durationSeconds);
-    res.header?.("X-BREEZEAPI-CACHE", "MISS");
-}
